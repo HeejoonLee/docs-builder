@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FCPU Executor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+  <a href="index.html">Overview</a>
+  <a href="handler.html">Handler</a>
+  <a href="executor.html" aria-current="page">Executor</a>
+  <a href="monitor.html">Monitor</a>
+  <a href="flows.html">Flows</a>
+  <a href="rules.html">Rules &amp; policies</a>
+</nav>
+<main>
+<h1>Executor</h1>
+<p class="lede">Takes TGTM workloads off the workload queue, turns them into descriptors, and, for auto workloads, runs every TGTM task to the end. Folder: <code>executor/</code>.</p>
+
+<h2>Responsibilities</h2>
+<ul>
+  <li>Only reader of the <b>workload queue</b>.</li>
+  <li>Holds the one active workload and its state machine.</li>
+  <li>Calls generators to write descriptors into DM.</li>
+  <li>Starts Executes for auto workloads and gets their outcomes from the monitor.</li>
+  <li>Sends <code>reply_loaded</code>, <code>reply_progress</code> and <code>reply_workload_done</code>.</li>
+</ul>
+
+<div class="rule">The executor never writes DM or starts an Execute while the monitor is watching a window. This one rule keeps workloads, raw Executes and auto tasks from overwriting each other's DM.</div>
+
+<h2>State machine</h2>
+<pre><code>            pop workload (only if monitor idle)
+   IDLE ─────────────────────────────────────► LOADING
+    ▲                                            │ gen fill → DM
+    │   manual: reply_loaded ◄───────────────────┤
+    │                                            │ auto: set start/end, Execute,
+    │                                            ▼       monitor_watch(STARTER_EXECUTOR)
+    │                                          RUNNING
+    │                                            │ monitor_take_outcome()
+    │       ┌──── DONE, more tasks, no cancel ───┤
+    │       │     reply_progress → LOADING       │
+    │       ▼                                    │ last task DONE / ERROR /
+    └──── rm_dump + reply_workload_done ◄────────┘ TIMEOUT / cancelled</code></pre>
+<table>
+  <tr><th>State</th><th>One step does</th></tr>
+  <tr><td>IDLE</td><td>If the workload queue has an entry and the monitor is idle: look up the command in <code>cmd_table</code>, call the generator's <b>begin</b>. If begin fails, reply with the error and stay IDLE. Otherwise go to LOADING.</td></tr>
+  <tr><td>LOADING</td><td>If cancel is pending: finish as CANCELLED. Otherwise call <b>fill</b> for one task (up to 2048 descriptors).<br>Manual: <code>reply_loaded</code> → IDLE.<br>Auto: write start/end, set Execute, <code>monitor_watch(STARTER_EXECUTOR)</code> → RUNNING.</td></tr>
+  <tr><td>RUNNING</td><td>Ask <code>monitor_take_outcome()</code>. Nothing yet: return. DONE with tasks left and no cancel: <code>reply_progress</code> → LOADING. Anything else: finish.</td></tr>
+  <tr><td><i>finish</i></td><td><code>rm_dump()</code>, <code>reply_workload_done(outcome, task index)</code>, clear cancel → IDLE.</td></tr>
+</table>
+
+<h3>Manual workloads</h3>
+<p>A manual workload is a single task. It loads at the DM index given in the request (default 0). Existing size checks reject anything that wouldn't fit, before DM is touched. After "loaded" the executor is done with it. ICPU then sends Executes as CSR writes through the handler. If ICPU queues another workload, the executor loads it as soon as the monitor is idle. ICPU is responsible for not queueing it before it has finished with the current DM contents.</p>
+
+<h3>Auto workloads</h3>
+<p>Tasks run back to back. An error or timeout in task <i>k</i> stops the workload. Later tasks don't run, and the final reply names task <i>k</i>. A Stop CSR write raises the cancel flag (<code>executor_cancel()</code>), which is checked before each task. Only the last task's RM comes back.</p>
+
+<h2 id="gen">Generator interface (<code>gen.h</code>)</h2>
+<p>Every command has the same shape, so the executor never needs to know what a command does:</p>
+<table>
+  <tr><th>Step</th><th>Does</th></tr>
+  <tr><td><b>begin</b>(request)</td><td>Validate parameters, work out the total descriptor count, reset the cursor. Returns OK or an error code.</td></tr>
+  <tr><td><b>fill</b>(dm_start, max)</td><td>Write up to <code>max</code> descriptors into DM from <code>dm_start</code>, advance the cursor, return how many were written.</td></tr>
+  <tr><td><b>finished</b>()</td><td>True once every descriptor has been written.</td></tr>
+</table>
+<p>The cursor (next address, descriptors issued so far, and so on) lives inside the generator's own file.</p>
+
+<h2>Command table (<code>cmd_table.c</code>)</h2>
+<pre><code>opcode         kind     generator
+WRITE          MANUAL   gen_write
+READ           MANUAL   gen_read
+SEQ_WRITE      AUTO     gen_seq_write
+SEQ_READ       AUTO     gen_seq_read
+RAND_READ      AUTO     gen_rand_read</code></pre>
+<p>The kind comes from the command type, never from the size. <b>Adding a command</b> means one new <code>gen_*.c</code> plus one row here. <code>executor.c</code> does not change.</p>
+
+<h2>Public interface</h2>
+<pre><code>void executor_work(void);
+void executor_cancel(void);     /* called by handler on Stop */</code></pre>
+</main>
+</body>
+</html>

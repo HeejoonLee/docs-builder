@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FCPU Design</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<nav>
+  <a href="index.html" aria-current="page">Overview</a>
+  <a href="handler.html">Handler</a>
+  <a href="executor.html">Executor</a>
+  <a href="monitor.html">Monitor</a>
+  <a href="flows.html">Flows</a>
+  <a href="rules.html">Rules &amp; policies</a>
+</nav>
+<main>
+<h1>FCPU firmware design</h1>
+<p class="lede">How the FCPU firmware is organised: three cooperative modules in one loop, each owning its own state and its own files. Terms are defined in <a href="../../GLOSSARY.md">GLOSSARY.md</a>.</p>
+
+<h2>What FCPU does</h2>
+<p>FCPU sits between ICPU and TGTM. It receives requests from ICPU through shared-memory queues, drives TGTM through its memories (DM, RM, UM) and CSR, and reports results back on the response queue.</p>
+<p>Requests come in two kinds, on two queues:</p>
+<table>
+  <tr><th>Kind</th><th>Queue</th><th>Examples</th><th>Served by</th></tr>
+  <tr><td><b>Direct request</b></td><td>Direct queue (1 entry)</td><td>CSR read/write (including Execute and Stop), DM/UM/RM read/write</td><td>Handler, replies right away</td></tr>
+  <tr><td><b>Manual workload</b></td><td>Workload queue</td><td><code>write</code>, <code>read</code></td><td>Executor: generate one task, load it, reply "loaded"</td></tr>
+  <tr><td><b>Auto workload</b></td><td>Workload queue</td><td><code>seq_write</code>, <code>seq_read</code>, <code>rand_read</code></td><td>Executor: generate and execute every task, then reply</td></tr>
+</table>
+
+<h2>The main loop</h2>
+<pre><code>init();
+for (;;) {
+    handler_work();    /* direct queue  */
+    executor_work();   /* workload queue */
+    monitor_work();    /* the running TGTM window */
+}</code></pre>
+<p>Each <code>_work()</code> does <b>one step</b> and returns, like a thread that yields. A step can be big (for example, generating 2048 descriptors). For now there is no latency budget, see <a href="rules.html#policies">policies</a>.</p>
+<p>Because the monitor only <em>checks</em> busy once per pass and returns, the handler keeps serving CSR requests while traffic is running. That is the main reason for this structure.</p>
+
+<h2>Modules</h2>
+<div class="cards">
+  <a class="card" href="handler.html"><b>Handler</b><span>Direct requests, Execute/Stop detection, all replies to ICPU</span></a>
+  <a class="card" href="executor.html"><b>Executor</b><span>Workload queue, workload state machine, descriptor generators</span></a>
+  <a class="card" href="monitor.html"><b>Monitor</b><span>Watches one Execute until it ends: busy, timeout, outcome, RM dump</span></a>
+</div>
+
+<h2>File layout</h2>
+<pre><code>main.c                 init + the 3-call loop
+cmd_table.c/.h         one row per workload command: opcode, kind, generator
+status.c/.h            debug status block at a fixed address
+handler/
+  handler.c            handler_work(): pop direct queue, dispatch
+  csr.c                CSR read/write, Execute/Stop detection
+  mem.c                DM/UM/RM read/write
+  reply.c/.h           every message FCPU sends to ICPU
+executor/
+  executor.c           executor_work(): workload queue, state machine
+  gen.h                the generator interface
+  gen_write.c  gen_read.c  gen_seq_write.c  gen_seq_read.c  gen_rand_read.c
+monitor/
+  monitor.c            monitor_work(): watch, timeout, outcome
+  rm_dump.c            copy RM to the shared buffer</code></pre>
+<p>TGTM register/address macros and the shared-queue API are defined elsewhere (TGTM headers, ICPU side) and are only <em>used</em> here.</p>
+
+<h2>Who works where</h2>
+<p>Each folder is one module with one public header. Modules share nothing but function calls (<a href="rules.html#ownership">ownership rules</a>), so two people can work in different folders without stepping on each other. The most common change, adding a workload command, touches only one new <code>executor/gen_*.c</code> file and one row in <code>cmd_table.c</code>.</p>
+
+<h2>Debug status block</h2>
+<p><code>status.c</code> keeps a small record at a fixed memory address that engineers can read with an ordinary direct memory read: executor state, monitor state, current workload seq ID and task index, window starter, last outcome, last error, and counters (requests served, windows run, timeouts, reply-queue overflows). Every module writes only its own fields. If the board hangs, this shows where each module is stuck, without a debugger.</p>
+</main>
+</body>
+</html>
