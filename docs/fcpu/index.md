@@ -1,68 +1,82 @@
 # FCPU firmware design
 
-How the FCPU firmware is organised: three cooperative modules in one loop, each owning its own state and its own files. Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
+How the FCPU firmware is organised: a scheduler on top of three leaf layers, run from one cooperative loop. Terms are defined in [GLOSSARY.md](../../GLOSSARY.md). Why it is shaped this way: [ADR 0001](../adr/0001-scheduler-over-three-leaf-layers.md).
 
-Pages: [Overview](index.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules & policies](rules.md)
+Up: [Project structure](../structure.md) · Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
 
-## What FCPU does
+## Layers
 
-FCPU sits between ICPU and TGTM. It receives requests from ICPU through shared-memory queues, drives TGTM through its memories (DM, RM, UM) and CSR, and reports results back on the response queue.
+```
+                       scheduler
+     (main-loop step, direct-request dispatch, workload loop)
+          │                  │                  │
+       handler            executor            monitor
+   shared-memory        DM / UM,            busy, interrupt and
+   protocol: queues,    control CSR,        error bits, timeout,
+   slots, ownership,    workload buffer     Stop on timeout,
+   messages             → DM copy           RM → response buffer copy
+```
 
-Requests come in two kinds, on two queues:
+- The **scheduler** is the only layer that calls other layers.
+- The **handler**, **executor** and **monitor** are leaves. They never call each other, and they return values instead of acting on what they find.
+- The handler owns the shared-memory protocol: queues, the direct slot, who owns which buffer area, and every message to ICPU.
+- Bulk data is copied once, directly, by the layer that owns that end of the task: the executor copies workload buffer → DM before a task, and the monitor copies RM → response buffer after it. The handler only hands over the area to use. Nothing is staged in between.
+- The executor and the monitor both touch TGTM CSR. The executor does control (start/end, interrupt clear, Execute, ICPU's CSR requests). The monitor reads status and writes Stop on timeout.
 
-| Kind | Queue | Examples | Served by |
-|---|---|---|---|
-| **Direct request** | Direct queue (1 entry) | CSR read/write (including Execute and Stop), DM/UM/RM read/write | Handler, replies right away |
-| **Manual workload** | Workload queue | `write`, `read` | Executor: generate one task, load it, reply "loaded" |
-| **Auto workload** | Workload queue | `seq_write`, `seq_read`, `rand_read` | Executor: generate and execute every task, then reply |
+| Layer | Owns | Page |
+|---|---|---|
+| Scheduler | Active workload, active task, cancel flag, stuck flag, command table | [scheduler.md](scheduler.md) |
+| Handler | Direct queue, workload queue, response queue, ownership of workload/response buffer areas | [handler.md](handler.md) |
+| Executor | DM/UM/RM access for direct requests, control CSR, `start_task()`, descriptor sources, response selection | [executor.md](executor.md) |
+| Monitor | The watch: poll count, Stop on timeout, outcome, RM → response buffer copy | [monitor.md](monitor.md) |
 
 ## The main loop
 
 ```c
 init();
-for (;;) {
-    handler_work();    /* direct queue  */
-    executor_work();   /* workload queue */
-    monitor_work();    /* the running TGTM window */
-}
+for (;;)
+    scheduler_step();
 ```
 
-Each `_work()` does **one step** and returns, like a thread that yields. A step can be big (for example, generating 2048 descriptors). For now there is no latency budget, see [policies](rules.md#policies-current-choices).
+`scheduler_step()` serves the direct queue first, then moves the active workload or task forward by one step and returns. Nothing ever waits in a loop on hardware, so a CSR read is answered within one step even in the middle of a long task.
 
-Because the monitor only *checks* busy once per pass and returns, the handler keeps serving CSR requests while traffic is running. That is the main reason for this structure.
+## One path for every workload
 
-## Modules
+Supplied and Generated workloads run through the same loop. The only difference is the **descriptor source** that fills DM:
 
-- **[Handler](handler.md)**: Direct requests, Execute/Stop detection, all replies to ICPU
-- **[Executor](executor.md)**: Workload queue, workload state machine, descriptor generators
-- **[Monitor](monitor.md)**: Watches one Execute until it ends: busy, timeout, outcome, RM dump
+| Source | `fill()` writes into DM |
+|---|---|
+| Copy source | The Descriptors straight from the workload-buffer area, byte for byte |
+| Generator source (`seq_write`, …) | Descriptors computed from the parameters |
+
+A Supplied workload is a source with at most 2048 Descriptors, so it runs as exactly one task. See [scheduler.md](scheduler.md#descriptor-source).
 
 ## File layout
 
 ```
-main.c                 init + the 3-call loop
-cmd_table.c/.h         one row per workload command: opcode, kind, generator
-status.c/.h            debug status block at a fixed address
+main.c                    init + loop
+scheduler/
+  scheduler.c             scheduler_step(): direct dispatch, workload state machine
+  cmd_table.c/.h          one row per workload kind: opcode → source
 handler/
-  handler.c            handler_work(): pop direct queue, dispatch
-  csr.c                CSR read/write, Execute/Stop detection
-  mem.c                DM/UM/RM read/write
-  reply.c/.h           every message FCPU sends to ICPU
+  direct.c                take / reply on the direct queue
+  workload.c              take / consume workload queue entries, CSR block area
+  response.c              response queue messages, response buffer area
 executor/
-  executor.c           executor_work(): workload queue, state machine
-  gen.h                the generator interface
-  gen_write.c  gen_read.c  gen_seq_write.c  gen_seq_read.c  gen_rand_read.c
+  mem.c                   DM / UM / RM read and write
+  csr.c                   CSR read and write, start_task()
+  select.c                select_responses()
+  source.h                the descriptor source interface
+  copy_source.c           workload buffer → DM
+  gen/                    gen_seq_write.c  gen_seq_read.c  gen_rand_read.c …
 monitor/
-  monitor.c            monitor_work(): watch, timeout, outcome
-  rm_dump.c            copy RM to the shared buffer
+  monitor.c               watch, poll, timeout, Stop, outcome
+  responses.c             RM → response buffer
+status.c/.h               debug status block at a fixed address
 ```
 
-TGTM register/address macros and the shared-queue API are defined elsewhere (TGTM headers, ICPU side) and are only *used* here.
-
-## Who works where
-
-Each folder is one module with one public header. Modules share nothing but function calls ([ownership rules](rules.md#ownership-rules)), so two people can work in different folders without stepping on each other. The most common change, adding a workload command, touches only one new `executor/gen_*.c` file and one row in `cmd_table.c`.
+TGTM register macros and the shared-memory layout come from shared headers. *TBD*.
 
 ## Debug status block
 
-`status.c` keeps a small record at a fixed memory address that engineers can read with an ordinary direct memory read: executor state, monitor state, current workload seq ID and task index, window starter, last outcome, last error, and counters (requests served, windows run, timeouts, reply-queue overflows). Every module writes only its own fields. If the board hangs, this shows where each module is stuck, without a debugger.
+`status.c` keeps a small record at a fixed address that engineers can read with an ordinary direct memory read: scheduler state, current workload sequence ID and task k of n, monitor state and poll count, last outcome, stuck flag, and counters (requests served, tasks run, timeouts, rejections). Each layer writes only its own fields.

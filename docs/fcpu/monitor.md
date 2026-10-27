@@ -1,53 +1,53 @@
 # Monitor
 
-Watches one Execute until TGTM stops being busy, works out the outcome, and gives it to whoever started that Execute. Folder: `monitor/`.
+Watches the running task until it ends, returns its outcome, and copies the task's Responses out of RM. It reads TGTM status CSR, writes Stop on timeout, and reads RM. It never touches the queues or DM/UM. Folder: `monitor/`.
 
-Pages: [Overview](index.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules & policies](rules.md)
+Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
 
-## Responsibilities
+## The watch
 
-- The only module that polls busy.
-- Checks the timeout while watching.
-- Reads the status and error registers once busy clears, and decides the outcome.
-- Sends the outcome to the window's **starter**.
-- Owns `rm_dump.c`.
-
-## Starter
-
-Each watch records who set Execute:
-
-| Starter | Set by | When the window ends |
-|---|---|---|
-| `STARTER_ICPU` | handler, on any CSR write that sets Execute (raw or not) | monitor: `rm_dump()` + `reply_window_done(outcome)` |
-| `STARTER_EXECUTOR` | executor, for each auto task | monitor stores the outcome. The executor collects it with `monitor_take_outcome()` and sends nothing itself. |
-
-There is only one watch at a time. An Execute that arrives while a watch is active doesn't start a second one.
-
-## One step of `monitor_work()`
+The scheduler calls `watch()` right after every Execute, then calls `poll()` once per step. Each `poll()` reads status once and returns. It never loops.
 
 ```
-if not watching: return
-if timed out (fixed macro):  outcome = TIMEOUT
-else if busy:                return              /* check again next pass */
-else read status/error regs: outcome = DONE or ERROR
-hand outcome to starter (table above)
-stop watching
+         watch()
+IDLE ──────────────► WATCHING
+                       │ busy, polls < POLL_LIMIT         → RUNNING
+                       │ busy low                          → DONE or ERROR
+                       │ polls reach POLL_LIMIT: write Stop
+                       ▼
+                     STOPPING
+                       │ busy low                          → TIMEOUT
+                       │ polls reach STOP_POLL_LIMIT       → STUCK
 ```
 
-Outcomes: **DONE**, **ERROR** (with the error register values), **TIMEOUT**. After a timeout the monitor reports and goes back to idle. It doesn't block later Executes. Recovering TGTM is up to the engineer.
+Every poll records the interrupt and error bits it reads. Interrupt bits never end a task and are never cleared here (the executor clears them before the next Execute). They go into the outcome.
 
-> **Note:** A Stop write kills TGTM, so busy may never clear. The watch then ends as TIMEOUT. That's expected, not a bug.
+## Outcome
 
-## RM dump (`rm_dump.c`)
+| Outcome | Meaning |
+|---|---|
+| **DONE** | Busy dropped, no error bits |
+| **ERROR** | Busy dropped with error bits set (values included) |
+| **TIMEOUT** | Busy didn't drop within `POLL_LIMIT`, Stop was written, then busy dropped |
+| **STUCK** | Busy didn't drop even after Stop. The scheduler sets its stuck flag and refuses new tasks |
 
-Copies all 8192 RM entries to one fixed shared buffer, without clearing RM first. ICPU reads the buffer before it sends its next Execute, so there is no overwrite race. The size, the buffer and the clearing behaviour are policy and can change later ([policies](rules.md#policies-current-choices)).
+Every outcome carries the interrupt bits seen. After any outcome the monitor is idle again.
+
+## Response copy (`responses.c`)
+
+```c
+copy_result copy_responses(const rm_range *sel, int nsel, area dst);
+```
+
+Once a task has ended in DONE or ERROR, the scheduler calls this with the task's response selection and the response-buffer area from `handler.response_area()`. It copies the selected RM entries straight into that area, with no staging. It copies what fits and returns how many, and whether it truncated. The selection itself is worked out by the executor before Execute, because that needs DM.
 
 ## Public interface
 
 ```c
-void monitor_work(void);
-void monitor_watch(starter_t who);
-bool monitor_is_watching(void);
-bool monitor_take_outcome(outcome_t *out);  /* executor-started windows only; true once */
-void rm_dump(void);
+void watch(void);
+bool is_watching(void);
+poll_result poll(outcome *out);   /* RUNNING, or ENDED with *out filled */
+copy_result copy_responses(const rm_range *sel, int nsel, area dst);
 ```
+
+`POLL_LIMIT` and `STOP_POLL_LIMIT` are macros in `monitor.c`.

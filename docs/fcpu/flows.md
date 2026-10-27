@@ -1,80 +1,90 @@
 # Flows
 
-The common cases, step by step. H = handler, E = executor, M = monitor.
+The common cases, step by step. S = scheduler, H = handler, E = executor, M = monitor.
 
-Pages: [Overview](index.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules & policies](rules.md)
+Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
 
-## CSR read while traffic runs
-
-```
-ICPU  direct: CSR read (axi response count)
-H     read CSR → reply_direct → release entry
-M     (still watching; checks busy on its own turn)
-```
-
-This works because M only checks busy once per pass and returns.
-
-## Manual workload: `write`
+## Supplied workload, 100 Descriptors
 
 ```
-ICPU  workload: write ... (seq 7)
-E     IDLE: monitor idle → begin OK → LOADING
-E     LOADING: fill → DM; reply_loaded(seq 7) → IDLE
-ICPU  direct: CSR write start=0, end=99
-H     write → reply_direct
+ICPU  writes 100 × 16B into the workload buffer, queues entry (seq 7, SUPPLIED)
+S     IDLE → H.take_workload (accept, resolve area) → cmd_table: copy_source → BEGIN
+S     BEGIN: copy_source.begin → 100, 1 task
+S     LOAD: E.load(copy_source, 0, 100)   ← workload buffer → DM, one copy
+S     H.consume_workload                   ← mark consumed, acknowledge to ICPU
+S     START: selection, E.start_task(0, 99), M.watch
+S     WATCH: M.poll … RUNNING … DONE
+S     FINISH: M.copy_responses(sel, H.response_area())   ← RM → response buffer, one copy
+S     H.send_final(seq 7, DONE)
+```
+
+## Generated workload, 5000 Descriptors
+
+```
+S     BEGIN: gen_seq_write.begin → 5000 = tasks of 2048 / 2048 / 904; H.consume_workload
+S     task 1: LOAD 2048 → START → WATCH … DONE → H.send_progress(1/3)
+S     task 2: … H.send_progress(2/3)
+S     task 3: LOAD 904 → START(0, 903) → WATCH … DONE
+S     FINISH: copy task 3's Responses; H.send_final(DONE)
+```
+
+This is the same loop as the Supplied case. Only the source differs.
+
+## Error in the middle
+
+```
+M     task 2 ends: ERROR (error bits)
+S     no task 3 → FINISH: copy task 2's Responses; send_final(ERROR, task 2, bits)
+```
+
+## CSR read while a task runs
+
+```
+ICPU  direct: CSR read
+S     serve_direct: E.csr_read → H.reply_direct
+S     advance: M.poll → RUNNING
+```
+
+## DM read while a task runs
+
+```
+ICPU  direct: DM read
+S     M.is_watching → H.reply_direct(BUSY)
+```
+
+## Raw Execute after a load-only workload
+
+```
+ICPU  workload (seq 9, load only) → S: BEGIN, LOAD → H.send_loaded(seq 9) → IDLE
+ICPU  direct: CSR write start=0, end=99   → served
 ICPU  direct: CSR write Execute
-H     write → reply_direct; monitor_watch(ICPU)
-M     busy … busy … clear → DONE
-M     rm_dump; reply_window_done(DONE)
-ICPU  (may Execute 0..99 again, or another range, without reloading)
+S     not watching, no workload, not stuck → E.select_responses(0, 99)
+      E.start_task_raw → M.watch → H.reply_direct(OK)
+S     WATCH … DONE → copy Responses; H.send_final(raw, DONE)
 ```
 
-## Auto workload: `seq_write`, 5000 descriptors
+## Raw Execute during a workload
 
 ```
-E     begin → 5000 descriptors = tasks of 2048 / 2048 / 904
-E     task 1: fill 2048, start=0 end=2047, Execute, monitor_watch(EXECUTOR)
-M     … DONE → stored for E
-E     take_outcome DONE → reply_progress(1/3) → LOADING
-E     task 2 … reply_progress(2/3)
-E     task 3: fill 904, end=903 … DONE
-E     rm_dump; reply_workload_done(DONE) → IDLE
+ICPU  direct: CSR write Execute
+S     workload active → H.reply_direct(BUSY)
 ```
 
-## Error in the middle of an auto workload
+## Timeout
 
 ```
-M     task 2 ends: ERROR (error regs captured)
-E     take_outcome ERROR → task 3 is not run
-E     rm_dump; reply_workload_done(ERROR, task 2, regs) → IDLE
+M     POLL_LIMIT reached → writes Stop → STOPPING
+M     busy drops → TIMEOUT
+S     FINISH: no Response copy; send_final(TIMEOUT)
 ```
 
-## Stop during an auto workload
+If busy never drops: STUCK. S sets the stuck flag, rejects Execute and memory access, and leaves queued workloads waiting. It clears the flag on a later CSR write after which busy reads low.
+
+## Stop from ICPU
 
 ```
 ICPU  direct: CSR write Stop
-H     write → executor_cancel() → reply_direct
-M     TGTM killed, busy never clears → TIMEOUT
-E     take_outcome TIMEOUT (cancel pending) → no more tasks
-E     rm_dump; reply_workload_done(TIMEOUT / cancelled) → IDLE
+S     E.csr_write → cancel flag → H.reply_direct(OK)
+M     task ends (busy drops, or timeout)
+S     cancelled → no more tasks → send_final(CANCELLED)
 ```
-
-If busy does clear normally after a Stop, the cancel flag still stops the next task from starting.
-
-## Raw Execute while an auto workload runs
-
-```
-ICPU  direct: CSR write Execute
-H     write (expert mode) → monitor already watching → no new watch → reply_direct
-M     the current watch keeps STARTER_EXECUTOR; outcome goes to E as usual
-```
-
-## Workload queued behind a manual workload
-
-```
-E     manual workload A loaded → IDLE
-ICPU  workload B queued
-E     IDLE: monitor idle → loads B over A's DM contents
-```
-
-ICPU must not queue B until it has finished executing A's windows. If one of A's windows is still being watched, E waits until it ends.
