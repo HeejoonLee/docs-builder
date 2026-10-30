@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0002
+---
+
 # Scheduler over three leaf layers, one descriptor-source path
 
 FCPU is split into a scheduler that alone calls the handler (the shared-memory protocol: queues, slots, buffer ownership, messages), the executor (TGTM memories and control CSR, plus the workload buffer → DM copy) and the monitor (status polling, timeout, Stop, plus the RM → response buffer copy). Those three are leaves that never call each other. This keeps each piece of hardware and each protocol structure behind exactly one owner, and lets the direct queue be served on every loop step even mid-task. Bulk data is copied once, directly between TGTM and the buffer area the handler hands over. It never passes through the scheduler.

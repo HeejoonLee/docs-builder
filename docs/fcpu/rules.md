@@ -2,37 +2,40 @@
 
 The rules keep the structure intact, so break them only on purpose. Policies are current choices that can each be changed in one place.
 
-Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
+Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Structs](structs.md) · [Flows](flows.md) · [Rules](rules.md)
 
-## Layer rules
+## Structure rules
 
-1. **Only the scheduler calls across layers.** The handler, executor and monitor never call each other.
-2. **The handler owns the shared-memory protocol; the executor and monitor do the copies.** Queues, the direct slot, buffer ownership and messages belong to the handler. Bulk data is copied once, directly, into or out of the area the handler hands over: workload buffer → DM by the executor, RM → response buffer by the monitor. No data passes through the scheduler and nothing is staged.
-3. **Leaves return, the scheduler decides.** The monitor returns an outcome and copies RM when the scheduler asks. It doesn't send messages or start anything.
-4. **One path for every workload.** The scheduler and executor never branch on Supplied vs. Generated. The difference lives in the descriptor source.
-5. **New generator = one source file + one `cmd_table` row.**
+1. **Calls go down the tree.** Scheduler → executor → monitor → `tgtm/`. The monitor returns an outcome, and the executor returns a step result. Nothing calls upward.
+2. **The scheduler decides when, the executor decides what, the monitor watches one task.** The monitor never decides what follows a task. The executor never touches the queues, the Mailbox words or Ready.
+3. **Mailbox and queue are different paths.** They enter the executor by different entry points, even when they end in the same CSR access. Only `tgtm/` is shared.
+4. **No staging.** The executor reads the Request payload area in place; the monitor writes RM into the Response region in place. Only the request header and areas are copied into FCPU state.
+5. **New generator = one `gen/` file + one `api_set.c` row.**
 
 ## Code rules
 
-1. **No shared globals.** Layer state is `static` in its `.c` file. Other layers use only the public header.
-2. **One step per call.** Nothing waits in a loop on hardware. The direct queue is served on every step.
-3. **Every Execute is a task, and every task is watched.** Execute happens only in `start_task()` / `start_task_raw()`, both of which clear interrupts first. The scheduler calls `monitor.watch()` right after.
-4. **No memory access while busy.** DM, UM and RM are only touched when no task is running. CSR is always accessible.
-5. **One task at a time.** A raw Execute is rejected while a task is running, a workload is active, or TGTM is stuck.
-6. **Response selection happens before Execute**, while DM can still be read.
+1. **No shared globals.** All state lives in the `struct scheduler` tree in `main.c`, passed by pointer.
+2. **Never wait on hardware.** Each step returns. The Mailbox is served between atomic steps.
+3. **Queued request handling is atomic.** From taking the entry until the task's Execute (or until the request finishes), there's no Mailbox in between. The same goes for each task's completion and each Generated task's preparation.
+4. **Every Execute is a task, every task belongs to a workload and is watched.** Execute is set only in `start_task()`, which clears interrupts first. `monitor_watch()` follows immediately.
+5. **No memory access while busy.** DM, UM and RM are touched only when no task is running. CSR is always accessible.
+6. **One workload at a time.** No Queued request is admitted, and a Mailbox Execute is rejected, while a workload is active.
+7. **Ready is checked before any shared-memory access.**
+8. **Never drop a response.** One pending response. A step that produces a response or writes the Response region waits until the region is free.
 
 ## Policies (current choices)
 
 | Policy | Now | Where to change |
 |---|---|---|
 | Timeout | `POLL_LIMIT` polls, then Stop. `STOP_POLL_LIMIT` more, then STUCK | `monitor.c` |
-| Stuck recovery | Cleared by a later CSR write after which busy reads low | `scheduler.c` |
-| Responses in a multi-task workload | Only the final task's (or the failing task's) | `scheduler.c` FINISH |
-| Responses on timeout / cancel | None | `scheduler.c` FINISH |
-| Response selection too big | Copy what fits, set truncated | `scheduler.c` |
-| Progress | One message after each non-final task, no Responses | `scheduler.c` WATCH |
-| Response wanted = off | Suppresses progress, loaded, and done. Errors are always sent | `handler/response.c` |
-| Error mid-workload | Stop at the first failing task | `scheduler.c` WATCH |
-| Stop write | Also cancels the active workload | `scheduler.c` |
-| Concurrent workloads | One active. The rest wait in the workload queue | `scheduler.c` IDLE |
-| Work per step | A whole DM load or RM copy in one step. Direct requests wait at most that long. To shorten it, pass a smaller `max` to `fill` and stay in LOAD for several steps. | `scheduler.c` |
+| Stuck | No Queued requests, no Mailbox memory access or Execute. Cleared by a Mailbox CSR write after which busy reads low | `executor/mailbox_ops.c` |
+| Out-of-order sequence | Consume, error response, expected number back to 0 | `scheduler.c` |
+| Response region | One response at a time; the next one waits until ICPU has read it | `scheduler/response.c` |
+| RM on a Mailbox Execute | None. Outcome only | `executor.c` TASK_ENDED |
+| RM on timeout / stuck / cancel | None | `executor.c` TASK_ENDED |
+| RM in a Generated workload | Final (or failing) task's only. Progress responses carry none | `executor.c` TASK_ENDED |
+| Response selection too big | Copy what fits, set truncated | `rm_copy.c` |
+| Response flag off | Suppresses success responses. Errors, timeouts and cancels always sent | `executor.c` |
+| Error in a Generated workload | Stop at the first task that doesn't end done | `executor.c` TASK_ENDED |
+| Stop write | Also cancels the active workload | `executor/mailbox_ops.c` |
+| Work per atomic step | A whole DIRECT_DM copy or RM copy. The Mailbox waits at most that long | (rule 3) |

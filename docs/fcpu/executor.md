@@ -1,63 +1,111 @@
 # Executor
 
-TGTM access: DM, UM and RM, and the control side of CSR. It copies a workload's Descriptors from the workload-buffer area the handler hands it straight into DM. It also holds the descriptor sources and response selection. It never touches the queues or the direct slot. Folder: `executor/`.
+Decides **what** a request does. It owns the active request copy, the workload, the current task, the stuck flag and the monitor. It reads the Request payload area it is handed and accesses TGTM through `tgtm/`. It never touches the queues, the Mailbox words or Ready. Folder: `executor/`.
 
-Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
+Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Structs](structs.md) · [Flows](flows.md) · [Rules](rules.md)
 
-## Memory
+## Entry points
 
-`mem_read` and `mem_write` on DM, UM and RM. The executor doesn't check busy itself. The scheduler only calls these when no task is running.
+| Entry | Called for | Runs |
+|---|---|---|
+| `executor_mailbox()` | Every Mailbox request | Immediately, in one call. Never changes the active request or task, except to start a Mailbox Execute workload or mark a Stop. |
+| `executor_begin()` | An admitted Queued request | The request's whole atomic part. Queued requests with no workload finish here. |
+| `executor_step()` | Each scheduler step while a workload is active | One atomic step of the workload state machine |
 
-`load(source, dm_index, max)` asks the source to `fill()` DM from `dm_index` with up to `max` Descriptors. It returns how many were written. It doesn't know or care which kind of source it has.
+## Mailbox requests
 
-## Descriptor sources
+| Request | Rejected when | Does | Reply |
+|---|---|---|---|
+| DM / UM / RM read | a task is running, or TGTM is stuck | `tgtm` read at (memory, index, word) | status, value read |
+| DM / UM / RM write | a task is running, or TGTM is stuck | `tgtm` write | status |
+| CSR read | never | read STATUS, ERROR; read the register; re-read STATUS, ERROR | the four STATUS/ERROR reads, value read |
+| CSR write, sets execute (**Mailbox Execute**) | a workload is active, or TGTM is stuck | start a single-task workload (below) | the four reads, value |
+| CSR write, sets stop | never | the write; mark the active workload cancelled | the four reads, value |
+| other CSR write | never | the write; if stuck and busy now reads low, clear stuck | the four reads, value |
 
-```c
-typedef struct {
-    int (*begin)(const workload_entry *e);       /* total count, or <0 error */
-    int (*fill)(uint16_t dm_index, int max);     /* writes into DM; returns count */
-} desc_source;
+Memory addressing: DM has 2048 indexes of 16B, RM 8192 indexes of 4B, UM *TBD*. "Word" selects the 4B word within the index.
+
+### Mailbox Execute
+
+```
+workload = { origin MAILBOX, tasks_total 1 }
+task     = { index 0, DM range = CSR start/end as they are, selection empty }
+start_task(); monitor_watch()                  → state WAIT_TASK
 ```
 
-| Source | `begin()` | `fill()` |
+DM is used as it is. If it's empty, TGTM reports the error, and that becomes the task outcome. No RM is copied. At task end a 16B outcome marked mailbox-origin goes on the Response queue (always, as there's no response flag).
+
+## Queued requests
+
+`executor_begin()` gets the checked header, the payload area and the Response region. It runs atomically and returns a `step_result` (see [scheduler.md](scheduler.md#step-results)).
+
+| Data type | Workload? | Atomic part |
 |---|---|---|
-| **Copy source** (`copy_source.c`) | Checks the area is whole 16B Descriptors, at most 2048 | Copies them from the workload-buffer area into DM, byte for byte. No staging buffer. |
-| **Generator** (`gen/`) | Validates parameters, returns the total | Computes Descriptors from a cursor in the generator's own file and writes them into DM |
+| DIRECT_DM | no | Check busy (safety; error if set). If the flag says so, apply the 16B CSR config at the start of the area (with basic checks). Copy `desc_count` Descriptors into DM from `desc_start`. Copy the UM data after them into UM. Consume. Command response. |
+| CONTROL, not EXECUTE | no | Read csr_offset, operation, value (8B after the header). Run the operation (a switch over fixed CSR sequences). Consume. Command response. |
+| CONTROL EXECUTE | single task | Read the Response selection from the payload. Consume. Create the workload `{ origin QUEUED, seq, tasks_total 1 }`. `start_task()`, `monitor_watch()`. Command response ("accepted"). → WAIT_TASK |
+| API_SET | Generated, 1..n tasks | `gen.begin(params)`: validate and return the Descriptor total. Consume. Split into tasks of up to 2048. Command response. → NEXT_TASK |
 
-## CSR
+The command response is sent only when the request's response flag is set; errors are always sent. Where exactly the Response selection sits in the EXECUTE payload: *TBD, take from the current code*.
 
-`csr_read` and `csr_write` serve ICPU's CSR requests as asked.
+## Workload state machine
 
-`start_task(start, end)` is the **only** way a workload task starts:
+```
+           Mailbox Execute / CONTROL EXECUTE          API_SET
+   IDLE ──────────────────────────────┐        ┌───────────────── IDLE
+                                      ▼        ▼
+                                   WAIT_TASK ◄── NEXT_TASK ◄───────────┐
+                                      │ monitor_poll()                 │
+                                      │ ended                          │
+                                      ▼                                │
+                                  TASK_ENDED ── more tasks, done,      │
+                                      │         not cancelled:         │
+                                      │         progress response ─────┘
+                                      │ otherwise
+                                      ▼
+                     RM copy (queued, done or error) + final response → IDLE
+```
+
+| State | Needs Response region | One step does |
+|---|---|---|
+| WAIT_TASK | no | `monitor_poll()`. Still running: return. Ended: keep the outcome; if STUCK, set the stuck flag. → TASK_ENDED |
+| TASK_ENDED | yes (waits if not free) | Last task, or not done, or cancelled: if a queued workload ended done or error, `monitor_copy_rm(selection, region)`; final response → IDLE. Otherwise: progress response → NEXT_TASK |
+| NEXT_TASK | no | `gen.fill(0, task size)` writes this task's Descriptors into DM. `start_task()`, `monitor_watch()` → WAIT_TASK |
+
+A Generated workload stops at the first task that doesn't end done. The final response carries that task's outcome and RM.
+
+## Starting a task
+
+`start_task()` in `executor.c` is the only code that sets Execute:
 
 ```
 clear all interrupt status bits
-write start index, end index
-set Execute
+write start index, end index      (FCPU-set tasks only; Mailbox Execute leaves CSR as it is)
+set execute
 ```
 
-`start_task_raw(value)` does the same for a raw Execute: clear interrupts, then perform ICPU's CSR write. No Execute skips the interrupt clear.
-
-## Response selection (`select.c`)
+## Generators (API_SET)
 
 ```c
-int select_responses(uint16_t start, uint16_t end, rm_range *out, int max);
+struct generator {
+    int (*begin)(struct area params);        /* total Descriptors, or <0 error */
+    int (*fill)(uint16_t dm_index, int max); /* writes into DM; returns count */
+};
 ```
 
-Works out which RM entries a task's Descriptors will write, by reading DM start..end. It is called before Execute, while TGTM is idle. Used whenever ICPU gives no range, including raw tasks.
-
-> **TODO:** the rule for mapping Descriptors to RM indices is not known yet. The body is a stub.
+`api_set.c` maps the API to its generator. **Adding a generator** means one new `gen/gen_*.c` and one table row. API_SET is not in production yet.
 
 ## Public interface
 
 ```c
-void mem_read(mem_id m, uint32_t off, void *out, int n);
-void mem_write(mem_id m, uint32_t off, const void *in, int n);
-int  load(const desc_source *s, uint16_t dm_index, int max);
-uint32_t csr_read(uint32_t off);
-void csr_write(uint32_t off, uint32_t v);
-void start_task(uint16_t start, uint16_t end);
-void start_task_raw(uint32_t off, uint32_t v);
-void apply_csr(area csr_block);              /* CSR values from the workload buffer */
-int  select_responses(uint16_t start, uint16_t end, rm_range *out, int max);
+void executor_init(struct executor *e);
+bool executor_active(const struct executor *e);   /* a workload is active */
+bool executor_stuck(const struct executor *e);
+void executor_mailbox(struct executor *e, const struct mailbox_req *req,
+                      struct mailbox_reply *reply);
+void executor_begin(struct executor *e, const struct request_header *hdr,
+                    struct area data, const struct area *region,
+                    struct step_result *res);
+void executor_step(struct executor *e, const struct area *region,  /* NULL = not free */
+                   struct step_result *res);
 ```

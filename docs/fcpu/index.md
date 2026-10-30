@@ -1,82 +1,91 @@
 # FCPU firmware design
 
-How the FCPU firmware is organised: a scheduler on top of three leaf layers, run from one cooperative loop. Terms are defined in [GLOSSARY.md](../../GLOSSARY.md). Why it is shaped this way: [ADR 0001](../adr/0001-scheduler-over-three-leaf-layers.md).
+How the FCPU firmware is organised: a scheduler that owns an executor, which owns a monitor, all run from one cooperative loop. Terms are defined in [GLOSSARY.md](../../GLOSSARY.md). Why it is shaped this way: [ADR 0002](../adr/0002-scheduler-owns-executor-owns-monitor.md).
 
-Up: [Project structure](../structure.md) · Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
+Up: [Project structure](../structure.md) · Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Structs](structs.md) · [Flows](flows.md) · [Rules](rules.md)
 
-## Layers
+## Ownership
 
 ```
-                       scheduler
-     (main-loop step, direct-request dispatch, workload loop)
-          │                  │                  │
-       handler            executor            monitor
-   shared-memory        DM / UM,            busy, interrupt and
-   protocol: queues,    control CSR,        error bits, timeout,
-   slots, ownership,    workload buffer     Stop on timeout,
-   messages             → DM copy           RM → response buffer copy
+scheduler                         decides WHEN
+  ├─ Ready check, Mailbox, Request queue, Response queue   (transport)
+  ├─ expected sequence number
+  ├─ pending response (queue side only)
+  └─ executor                     decides WHAT
+       ├─ copy of the active Queued request (header + payload area)
+       ├─ workload  (tasks total / done, origin, cancelled)
+       ├─ current task  (DM range, Response selection)
+       ├─ stuck flag
+       └─ monitor                 watches ONE task
+            └─ watch state, poll count, bits seen
+
+tgtm/   low-level DM / UM / RM / CSR access, shared by everyone above
 ```
 
-- The **scheduler** is the only layer that calls other layers.
-- The **handler**, **executor** and **monitor** are leaves. They never call each other, and they return values instead of acting on what they find.
-- The handler owns the shared-memory protocol: queues, the direct slot, who owns which buffer area, and every message to ICPU.
-- Bulk data is copied once, directly, by the layer that owns that end of the task: the executor copies workload buffer → DM before a task, and the monitor copies RM → response buffer after it. The handler only hands over the area to use. Nothing is staged in between.
-- The executor and the monitor both touch TGTM CSR. The executor does control (start/end, interrupt clear, Execute, ICPU's CSR requests). The monitor reads status and writes Stop on timeout.
+| Module | Owns | Does | Page |
+|---|---|---|---|
+| Scheduler | Transport, expected sequence number, pending response, the executor | Checks Ready, serves the Mailbox, admits Queued requests in order, delivers responses | [scheduler.md](scheduler.md) |
+| Executor | Active request copy, workload, current task, stuck flag, the monitor | Runs Mailbox and Queued requests, starts tasks, decides what follows each task, builds responses | [executor.md](executor.md) |
+| Monitor | The watch of one task | Polls busy, times out and Stops, returns the task outcome, copies RM into the Response region | [monitor.md](monitor.md) |
+| TGTM module | Nothing | Reads and writes DM, UM, RM and CSR | [../tgtm/](../tgtm/index.md) |
 
-| Layer | Owns | Page |
-|---|---|---|
-| Scheduler | Active workload, active task, cancel flag, stuck flag, command table | [scheduler.md](scheduler.md) |
-| Handler | Direct queue, workload queue, response queue, ownership of workload/response buffer areas | [handler.md](handler.md) |
-| Executor | DM/UM/RM access for direct requests, control CSR, `start_task()`, descriptor sources, response selection | [executor.md](executor.md) |
-| Monitor | The watch: poll count, Stop on timeout, outcome, RM → response buffer copy | [monitor.md](monitor.md) |
+- Calls go **down** the tree only. The monitor returns an outcome to the executor; the executor returns a step result to the scheduler.
+- **Only the scheduler touches the queues and the Mailbox words.** The executor reads the Request payload area it was handed, and the monitor writes RM into the Response region area it was handed. Nothing is staged in FCPU memory.
+- Mailbox and Queued requests enter the executor by **different entry points**. Even when they end in the same CSR write, the paths differ. Only the TGTM module is shared.
 
 ## The main loop
 
 ```c
-init();
-for (;;)
-    scheduler_step();
+int main(void)
+{
+    static struct scheduler s;
+    init();                 /* platform, TGTM, status block */
+    scheduler_init(&s);
+    for (;;)
+        scheduler_step(&s);
+}
 ```
 
-`scheduler_step()` serves the direct queue first, then moves the active workload or task forward by one step and returns. Nothing ever waits in a loop on hardware, so a CSR read is answered within one step even in the middle of a long task.
+`scheduler_step()` never waits on hardware. Each call is one or more **atomic steps**, and the Mailbox is only served between them:
 
-## One path for every workload
-
-Supplied and Generated workloads run through the same loop. The only difference is the **descriptor source** that fills DM:
-
-| Source | `fill()` writes into DM |
+| Atomic step | Contains |
 |---|---|
-| Copy source | The Descriptors straight from the workload-buffer area, byte for byte |
-| Generator source (`seq_write`, …) | Descriptors computed from the parameters |
+| Mailbox request | Peek, run, reply, set done bit |
+| Queued request handling | Header and sequence check, the request's work (copies, CSR ops, task start), ConsumeRequest, command response |
+| Task poll | One read of status |
+| Task completion | RM copy, progress or final response |
+| Next task (Generated workload) | Generate this task's Descriptors into DM, Execute |
 
-A Supplied workload is a source with at most 2048 Descriptors, so it runs as exactly one task. See [scheduler.md](scheduler.md#descriptor-source).
+So a Mailbox CSR read is answered within one atomic step, even in the middle of a long task.
 
 ## File layout
 
 ```
-main.c                    init + loop
+main.c
 scheduler/
-  scheduler.c             scheduler_step(): direct dispatch, workload state machine
-  cmd_table.c/.h          one row per workload kind: opcode → source
-handler/
-  direct.c                take / reply on the direct queue
-  workload.c              take / consume workload queue entries, CSR block area
-  response.c              response queue messages, response buffer area
+  scheduler.c       scheduler_step(), Ready, admission, sequence check, pending response
+  mailbox.c         peek / complete the Mailbox words (memory and CSR forms)
+  queue.c           Request queue peek / consume, header read
+  response.c        Response region free check, 16B write, Response queue post
 executor/
-  mem.c                   DM / UM / RM read and write
-  csr.c                   CSR read and write, start_task()
-  select.c                select_responses()
-  source.h                the descriptor source interface
-  copy_source.c           workload buffer → DM
-  gen/                    gen_seq_write.c  gen_seq_read.c  gen_rand_read.c …
+  executor.c        entry points, workload state machine, start_task()
+  mailbox_ops.c     Mailbox memory and CSR operations, Mailbox Execute, Stop
+  direct_dm.c       DIRECT_DM: config, Descriptors → DM, UM data → UM
+  control.c         CONTROL operations (switch), EXECUTE
+  api_set.c         API_SET: generator lookup, task split
+  gen/              gen_seq_write.c  gen_seq_read.c  gen_rand_read.c …
 monitor/
-  monitor.c               watch, poll, timeout, Stop, outcome
-  responses.c             RM → response buffer
-status.c/.h               debug status block at a fixed address
+  monitor.c         watch, poll, timeout, Stop, outcome
+  rm_copy.c         RM → Response region
+tgtm/
+  tgtm.c            region and CSR access
+status.c/.h         debug status block
 ```
 
 TGTM register macros and the shared-memory layout come from shared headers. *TBD*.
 
 ## Debug status block
 
-`status.c` keeps a small record at a fixed address that engineers can read with an ordinary direct memory read: scheduler state, current workload sequence ID and task k of n, monitor state and poll count, last outcome, stuck flag, and counters (requests served, tasks run, timeouts, rejections). Each layer writes only its own fields.
+`status.c` keeps a small record at a fixed FCPU address with a fixed layout: scheduler expected sequence number and pending flag, executor state, workload origin, sequence number and task k of n, monitor state and poll count, last task outcome, stuck flag, and counters (Mailbox requests, Queued requests, tasks, timeouts, rejections, sequence errors). Each module writes only its own fields.
+
+ICPU can't read FCPU memory today. The layout is fixed so that a later Mailbox "read status" request, or moving the block into shared memory, is a small change.

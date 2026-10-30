@@ -1,105 +1,105 @@
 # Scheduler
 
-The top layer. It owns the main-loop step and is the only code that calls the handler, executor and monitor. Folder: `scheduler/`.
+The top of the tree. It owns the ICPU ↔ FCPU transport and the executor, and decides **when** each request runs. It knows nothing about Descriptors, busy, or RM. Folder: `scheduler/`.
 
-Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Handler](handler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Flows](flows.md) · [Rules](rules.md)
+Pages: [Overview](index.md) · [Scheduler](scheduler.md) · [Executor](executor.md) · [Monitor](monitor.md) · [Structs](structs.md) · [Flows](flows.md) · [Rules](rules.md)
 
 ## One step
 
 ```
-scheduler_step():
-    serve_direct()        # at most one direct request
-    advance()             # one step of the active task / workload
+scheduler_step(s):
+    shm = ready_is_set()                       # read on every step; normally always set
+
+    if shm and s.response_pending:
+        try_deliver(s)                         # Response region free? write 16B, post entry
+
+    if shm:
+        serve_mailbox(s)                       # at most one Mailbox request
+
+    region = response_region_if_free(s, shm)   # NULL unless shm, nothing pending, ICPU caught up
+
+    if executor_active(&s.executor):
+        executor_step(&s.executor, region, &res)
+        handle(s, res)
+    else if region and not executor_stuck(&s.executor):
+        admit_queued(s, region)
 ```
 
-## Serving a direct request
+While Ready is clear, the step does no shared-memory work at all. The executor still advances the hardware side (it keeps polling the monitor), but any step that needs the Response region waits.
+
+## Ready
+
+ICPU sets Ready. FCPU reads it every time it is about to touch shared memory, once per step. If it reads clear, FCPU skips the Mailbox, the Request queue and response delivery for that step. That isn't an error, and nothing is reported.
+
+## Mailbox
 
 ```
-req = handler.take_direct()          # nothing → return
-check req against the busy rules     # rejected → handler.reply_direct(BUSY)
-perform it through the executor
-handler.reply_direct(result)
+serve_mailbox(s):
+    req = mailbox_peek()          # done bit of reserved[0] is 0 → a request is there
+    if none: return
+    executor_mailbox(&s.executor, &req, &reply)
+    mailbox_complete(&reply)      # reserved[1], reserved[2], then set the done bit
 ```
 
-| Request | Rejected when | Extra action |
-|---|---|---|
-| CSR read | never | |
-| CSR write, sets Execute (raw Execute) | a task is running, a workload is active, or TGTM is stuck | Starts a raw task (below) |
-| CSR write, sets Stop | never | Raise the cancel flag on the active workload |
-| other CSR write | never | If TGTM is stuck and busy now reads low, clear the stuck flag |
-| DM / UM / RM read or write | a task is running, or TGTM is stuck | |
+The reply goes straight into the Mailbox words in the same step, so there's no pending slot for it. ICPU can't send another request until it sees the done bit.
 
-"A task is running" means the monitor is watching. Every Execute is watched, so that's the same as TGTM being busy.
+The two Mailbox forms (memory access, CSR access) and their reply words are described in [executor.md](executor.md#mailbox-requests). `mailbox.c` only packs and unpacks the words.
 
-### Raw task
+## Admitting a Queued request
+
+Only when the executor is idle (no workload), TGTM is not stuck, and the Response region is free. The whole thing is one atomic step.
 
 ```
-start, end = executor.csr_read(start index, end index)
-selection  = executor.select_responses(start, end)    # DM read, TGTM idle
-executor.start_task_raw(csr value)                    # clear interrupts, then the write
-monitor.watch()
-active task = { raw, selection }
+admit_queued(s, region):
+    entry = queue_peek()                          # write_count != read_count
+    if none: return
+    hdr = queue_read_header(entry)                # payload[0], payload[1]
+
+    if header invalid:              reject(entry, INVALID)
+    elif hdr.seq != s.expected_seq: reject(entry, SEQUENCE); s.expected_seq = 0
+    else:
+        s.expected_seq = hdr.end_sequence ? 0 : hdr.seq + 1
+        executor_begin(&s.executor, &hdr, entry.area, region, &res)
+        handle(s, res)
+
+reject(entry, err):
+    queue_consume()
+    store error response                          # always, even if response flag is off
 ```
 
-When the watch ends: copy Responses (done or error), then `handler.send_final(raw, outcome)`.
+The sequence check is part of admission, so the executor never sees an out-of-order request.
 
-## Workload state machine
+## Step results
 
-```
-          peek entry (no workload, not watching, not stuck)
-   IDLE ─────────────────────────────────────────────► BEGIN
-    ▲                                                    │ source.begin(): total, n tasks
-    │◄── error: send_final(error), release ──────────────┤
-    │                                                    ▼
-    │                                                  LOAD ◄─────────────┐
-    │                                                    │ executor.load()│
-    │                                                    │ until task full│
-    │    load only: send_loaded ─────────────────────────┤                │
-    │                                                    ▼                │
-    │                                                  START              │
-    │                                                    │ CSR block,     │
-    │                                                    │ selection,     │
-    │                                                    │ start_task(),  │
-    │                                                    │ monitor.watch()│
-    │                                                    ▼                │
-    │                                                  WATCH              │
-    │                                                    │ monitor.poll() │
-    │          more tasks, task done, not cancelled ─────┼─ send_progress ┘
-    │                                                    ▼
-    └──────────────────── FINISH: copy Responses (done/error), send_final
+The executor never touches the queues. It returns what it wants done:
+
+```c
+struct step_result {
+    bool consume;               /* payload no longer needed → ConsumeRequest */
+    bool respond;               /* a response to deliver */
+    struct response response;   /* 16B command response + RM count */
+};
 ```
 
-| State | One step does |
-|---|---|
-| IDLE | If no workload, no watch and not stuck: `handler.take_workload()`. Found one: look up its kind in `cmd_table`, go to BEGIN. |
-| BEGIN | `source.begin(entry)`: validate, return the total Descriptor count. Work out the number of tasks (2048 per task). Load only with more than one task, or a Supplied total over 2048: reject. For a Generated workload the parameters are now read, so `handler.consume_workload()`. |
-| LOAD | `executor.load(source, 0, task size)`. The source writes this task's Descriptors into DM. A Supplied workload is now copied, so `handler.consume_workload()`. Load only: `send_loaded` → IDLE. |
-| START | If cancelled: FINISH (cancelled). Otherwise: if present (first task only), `executor.apply_csr(handler.csr_block(entry))` writes the CSR block straight from the workload buffer; work out the response selection (ICPU's range, or `executor.select_responses()`), `executor.start_task(0, count-1)`, `monitor.watch()`. |
-| WATCH | `monitor.poll()`. Still running: return. Task done, more tasks, not cancelled: `send_progress` → LOAD. Otherwise → FINISH. |
-| FINISH | If the final outcome is done or error: `monitor.copy_responses(selection, handler.response_area())`. `send_final`. Clear workload and cancel flag → IDLE. |
-
-"Response wanted = off" turns `send_progress`, `send_loaded` and a done `send_final` into no-ops. Error, timeout and cancel are always sent.
-
-## Descriptor source
-
-The [descriptor source](executor.md#descriptor-sources) interface is `begin()` + `fill()`. The scheduler and the executor never ask which kind of source they have. `cmd_table` maps each workload kind to its source:
-
 ```
-kind          source
-SUPPLIED      copy_source        (executor/)
-SEQ_WRITE     gen_seq_write      (executor/gen/)
-SEQ_READ      gen_seq_read
-RAND_READ     gen_rand_read
+handle(s, res):
+    if res.consume: queue_consume()
+    if res.respond: s.response = res.response; s.response_pending = true
 ```
 
-**Adding a generator** means one new `executor/gen/gen_*.c` and one row here. If it means touching `scheduler.c`, the interface is missing something, so fix the interface.
+## Response delivery
 
-## No data passes through the scheduler
+There is one Response region: a 16B command response at its start, then room for 2048 RM entries. FCPU posts a new response only after ICPU has read the previous one.
 
-The scheduler only moves *areas* (where to read, where to write) from the handler to the executor and monitor. Every byte is copied once: workload buffer → DM by the executor, RM → response buffer by the monitor.
+- **Region free** means: nothing pending, and the Response queue's read_count has caught up with its write_count.
+- Any executor step that writes RM or produces a response gets the region only when it's free. If it isn't free, the executor waits (it never drops a response). Polling the monitor doesn't need the region, so it continues.
+- `try_deliver()` writes the 16B response to the start of the region, then posts one entry: (region address, 16 + 4 × RM count).
+
+While a response waits, the Mailbox is still served; it doesn't use the Response queue.
 
 ## Public interface
 
 ```c
-void scheduler_step(void);
+void scheduler_init(struct scheduler *s);
+void scheduler_step(struct scheduler *s);
 ```
