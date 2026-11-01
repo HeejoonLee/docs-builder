@@ -2,7 +2,7 @@
 
 The ICPU side of the ICPU ↔ FCPU protocol: what ICPU writes, what it waits for, and which rules it must keep. CLI parsing and display are out of scope here. Layout: [structure.md](../structure.md#shared-memory-between-icpu-and-fcpu).
 
-Up: [Project structure](../structure.md) · FCPU side: [fcpu/](../fcpu/index.md)
+Up: [Project structure](../structure.md) · FCPU side: [design/fcpu-arc42.md](../design/fcpu-arc42.md)
 
 ## Ready
 
@@ -14,21 +14,22 @@ For TGTM memory read/write (DM, UM, RM) and CSR read/write. Served immediately, 
 
 1. Wait for the done bit in `reserved[0]`.
 2. Write the request with done = 0 (and the value in `reserved[2]` for a write).
-3. Wait for done = 1, then read `reserved[1]` (status, or STATUS/ERROR) and `reserved[2]` (value).
+3. Wait for done = 1, then read `reserved[1]` (Request status, or Status/Err type before and after) and `reserved[2]` (value).
 
-| Request | Rejected while |
+| Request | Rejected (`busy`) while |
 |---|---|
 | CSR read, CSR write | never, except below |
-| CSR write that sets execute (**Mailbox Execute**) | a workload is active, or TGTM is stuck |
-| DM / UM / RM read or write | a task is running, or TGTM is stuck |
+| CSR write to Execution bit 0 (**Mailbox Execute**) | a workload is active, or TGTM is stuck |
+| CSR write to 0x00–0x28 (except STOP), Interrupt enable or Interrupt clear | a workload is active |
+| DM / UM / RM read or write | a task is running, TGTM or that memory is busy, or TGTM is stuck |
 
 ### Mailbox Execute
 
-A debug path. Set start and end index with ordinary Mailbox CSR writes, then set execute. FCPU runs the Descriptors already in DM as a single-task workload. The Mailbox reply only says "accepted". The outcome arrives later on the Response queue, marked mailbox-origin, with no RM entries. Read RM with Mailbox memory reads if you want them.
+A debug path. Set Start index and End index with ordinary Mailbox CSR writes, then write 1 to Execution bit 0. FCPU runs the Descriptors already in DM as a single-task workload. The Mailbox reply only says "accepted". The outcome arrives later on the Response queue, marked mailbox-origin, with no RM entries. Read RM with Mailbox memory reads if you want them.
 
 ### Stop
 
-A Mailbox CSR write that sets stop halts TGTM and cancels the active workload. Its final response says cancelled.
+A Mailbox CSR write to STOP halts TGTM and cancels the active workload: no further tasks run. If the current task was still running, the final response says `aborted`. If it had already ended, its outcome (and RM) is reported as it is, marked cancelled. RESUME (0x10): *TBD*.
 
 ## Queued requests
 
@@ -38,23 +39,28 @@ A Mailbox CSR write that sets stop halts TGTM and cancels the active workload. I
 
 | Data type | Does | Creates a workload |
 |---|---|---|
-| DIRECT_DM | Optional CSR config, Descriptors → DM from the start index, optional UM data → UM | no |
-| CONTROL | One control operation (CSR access or a fixed set of them) | only EXECUTE: one task |
+| DIRECT_DM | CSR config (Has config), Descriptors → DM from the start index, UM data → UM (Has UM) | no |
+| CONTROL | One control operation (CSR access or a fixed set of them) | only EXECUTE: one task over the Start index / End index currently in CSR |
 | API_SET | FCPU generates the Descriptors and runs them | yes, one or more tasks |
 
 FCPU takes no Queued request while a workload is active, so a DIRECT_DM queued after an EXECUTE waits for that task to finish.
 
 ### Sequence numbers
 
-Requests in a sequence are numbered 0, 1, 2, … and the last one sets END_SEQUENCE. A request out of order is consumed without being run, and gets an error response. The next request must then start again at 0.
+Every Queued request is in a Sequence. The first sets FIRST and has seq 0, the rest count up 1, 2, … and the last sets LAST. A request on its own sets both. A request that breaks this (out of order, no FIRST with no Sequence open, FIRST while one is open) is consumed without being run and gets a `sequence` response. The Sequence is then closed, so the next request must set FIRST.
 
 ### Flags
 
-| Flag | Effect |
-|---|---|
-| response wanted | Off: no command, progress or success responses. Errors, timeouts and cancels are always sent. |
-| config present (DIRECT_DM) | The data starts with 16B of CSR values. |
-| END_SEQUENCE | Closes the sequence. |
+| Bit | Flag | Effect |
+|---|---|---|
+| 0 | FIRST | Opens a Sequence (seq 0) |
+| 1 | LAST | Closes the Sequence |
+| 2 | Has config (DIRECT_DM) | The data starts with CSR config values (registers and size *TBD*) |
+| 3 | Has UM (DIRECT_DM) | The data ends with UM data |
+| 4 | Need response | Off: no command, progress or success responses. Errors, timeouts and cancels are always sent |
+| 5 | RM by descriptor (EXECUTE, API_SET) | The final response carries the RM entries of the Descriptors that ran |
+
+Setting a flag on a data type it doesn't apply to gets `invalid`. So does RM by descriptor without Need response.
 
 ## Responses
 
@@ -64,5 +70,7 @@ Each Response queue entry points at the Response region: a 16B response, then an
 |---|---|---|
 | **Command** | A Queued request was handled (for EXECUTE / API_SET: accepted) | none |
 | **Progress** | After each non-final task of a Generated workload | none |
-| **Final** | A workload ends: done, error, timeout, stuck, cancelled | Response selection, for a queued workload that ended done or error |
-| **Error** | Invalid header or out-of-order sequence number | none |
+| **Final** | A workload ends: OK, execution, timeout (stuck marked), aborted. On execution and timeout it also carries Err type and Current descriptor index | With RM by descriptor, for a queued workload that ended OK or execution |
+| **Error** | `invalid`, `sequence`, `length`, `csr`, `unsupported`, `busy` | none |
+
+Every response and Mailbox reply carries a Request status: [structure.md](../structure.md#request-status).

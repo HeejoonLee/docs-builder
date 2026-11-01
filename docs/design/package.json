@@ -1,0 +1,14 @@
+{
+  "name": "fcpu-design-doc",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "devDependencies": {
+    "github-slugger": "^2.0.0",
+    "marked": "^18.1.2",
+    "mermaid": "^12.2.0",
+    "playwright-core": "^1.64.1"
+  }
+}
